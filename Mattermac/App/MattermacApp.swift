@@ -2,6 +2,10 @@ import SwiftUI
 
 @main
 struct MattermacApp: App {
+  init() {
+    KeychainContinuityProbe.runIfRequested()
+  }
+
   var body: some Scene {
     WindowGroup("Mattermac", id: "main") {
       WelcomeView()

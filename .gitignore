@@ -1,0 +1,20 @@
+# Local secrets and discovery artifacts.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+secrets/
+tmp/
+.codex/tmp/
+
+# Xcode and Swift Package Manager build products and user state.
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xcresult

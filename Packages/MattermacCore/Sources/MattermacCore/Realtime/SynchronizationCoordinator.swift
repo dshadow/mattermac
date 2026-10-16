@@ -3,7 +3,7 @@ import Observation
 
 public enum SynchronizationOrigin: Sendable { case live, recovery }
 
-public struct MattermostReaction: Decodable, Sendable, Hashable {
+public struct MattermostReaction: Codable, Sendable, Hashable {
   public let userID: String
   public let postID: String
   public let emojiName: String
@@ -14,8 +14,7 @@ public struct MattermostReaction: Decodable, Sendable, Hashable {
   }
 }
 
-/// Single writer for REST imports and socket events. Phase 4 uses a bounded, disposable
-/// in-memory repository. Phase 5 must commit these values/checkpoints in one store transaction.
+/// Publishes bounded value snapshots after the session commits repository transactions.
 @MainActor @Observable public final class SynchronizationCoordinator {
   public private(set) var channels: [MattermostChannel] = []
   public private(set) var selectedChannelID: String?
@@ -38,6 +37,17 @@ public struct MattermostReaction: Decodable, Sendable, Hashable {
   private var reactionMutations: [MattermostReaction: UInt64] = [:]
 
   public init() {}
+
+  func restore(_ snapshot: CacheSnapshot) {
+    setChannels(snapshot.channels)
+    selectChannel(snapshot.selectedChannelID)
+    if let ticket = beginImport() {
+      let page = ChannelPosts(
+        order: snapshot.posts.map(\.id),
+        posts: Dictionary(uniqueKeysWithValues: snapshot.posts.map { ($0.id, $0) }))
+      commit(page, reactions: snapshot.reactions, ticket: ticket)
+    }
+  }
 
   struct ImportTicket: Sendable {
     let generation: UUID
@@ -93,7 +103,8 @@ public struct MattermostReaction: Decodable, Sendable, Hashable {
   /// A complete latest-200 response replaces the window, recovering missed deletes too.
   /// Overlay events received during the request; never resurrect a session tombstone.
   @discardableResult func commit(
-    _ page: ChannelPosts, reactions baseline: [MattermostReaction] = [], ticket: ImportTicket
+    _ page: ChannelPosts, reactions baseline: [MattermostReaction] = [], ticket: ImportTicket,
+    checkpoint: UUID = UUID()
   ) -> Bool {
     guard ticket.generation == generation, ticket.window == windowGeneration,
       ticket.channelID == selectedChannelID
@@ -133,7 +144,7 @@ public struct MattermostReaction: Decodable, Sendable, Hashable {
     publish()
     // Historical posts are never future notification candidates on duplicate delivery.
     for post in posts { rememberNotification(post.id) }
-    checkpoint = UUID()
+    self.checkpoint = checkpoint
     return true
   }
 

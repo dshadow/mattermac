@@ -67,6 +67,14 @@ struct AuthenticationView: View {
       )
     }
     .task { await session.start() }
+    .task(id: session.phase) {
+      guard session.phase == .authenticated else { return }
+      while !Task.isCancelled {
+        await session.realtime?.storage?.maintain(
+          activeChannelID: session.realtime?.synchronization.selectedChannelID)
+        do { try await Task.sleep(for: .seconds(3_600)) } catch { return }
+      }
+    }
     .task(id: scenePhase) {
       guard scenePhase == .active else { return }
       // Check periodically while active; returning from sleep also checks immediately.

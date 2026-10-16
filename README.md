@@ -5,7 +5,8 @@ The goal is a lightweight app for everyday messaging that feels at home on your 
 
 **Early development:** native username/password sign-in, optional MFA, saved
 sessions and sign-out are available. A read-only channel picker shows the latest
-200 messages, with live edits, deletions, reactions and reconnect recovery.
+200 messages, with live edits, deletions, reactions and reconnect recovery. Recent
+messages are cached across restarts, with configurable retention in Settings.
 It is not ready for daily use.
 
 Mattermac is an independent project, not affiliated with Mattermost, Inc.
@@ -41,8 +42,12 @@ Sign out before switching accounts. Sign-out removes local credentials and
 attempts server revocation; if offline, server revocation cannot be confirmed.
 
 Choose a channel after signing in. Connection status shows when recent messages
-have recovered after a network interruption or wake. Messages stay in memory;
-older history, sending, attachments and desktop notifications are still planned.
+have recovered after a network interruption or wake. Previously opened messages
+load from local cache after session verification, followed by server updates.
+Settings defaults to 30 days of inactive cache retention. Local data relies on
+macOS permissions and your FileVault settings; it is not independently encrypted.
+Sign-out removes account cache and unsent work after confirmation. Older history,
+sending, attachments and desktop notifications are still planned.
 
 ## Development
 
@@ -89,6 +94,7 @@ formatter, describe your changes, and include screenshots for UI changes.
 - [Architecture decisions](DECISIONS.md): design choices and rationale.
 - [Signing guide](docs/signing.md): signing setup and credential persistence requirements.
 - [Real-time synchronization](docs/realtime.md): connection lifecycle and recovery boundaries.
+- [Local persistence](docs/persistence.md): cache retention, migrations and durable unsent work.
 
 ## License
 

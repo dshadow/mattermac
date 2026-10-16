@@ -48,7 +48,7 @@ public struct LoginSession: Sendable {
 }
 
 // Decode only fields used by the initial navigation and messaging slice.
-public struct MattermostUser: Decodable, Sendable, Equatable, Identifiable {
+public struct MattermostUser: Codable, Sendable, Equatable, Identifiable {
   public let id: String
   public let username: String
   public let firstName: String?
@@ -63,7 +63,7 @@ public struct MattermostUser: Decodable, Sendable, Equatable, Identifiable {
   }
 }
 
-public struct MattermostTeam: Decodable, Sendable, Equatable, Identifiable {
+public struct MattermostTeam: Codable, Sendable, Equatable, Identifiable {
   public let id: String
   public let name: String
   public let displayName: String
@@ -74,7 +74,7 @@ public struct MattermostTeam: Decodable, Sendable, Equatable, Identifiable {
   }
 }
 
-public struct MattermostChannel: Decodable, Sendable, Equatable, Identifiable {
+public struct MattermostChannel: Codable, Sendable, Equatable, Identifiable {
   public let id: String
   public let teamID: String
   public let name: String
@@ -89,7 +89,7 @@ public struct MattermostChannel: Decodable, Sendable, Equatable, Identifiable {
   }
 }
 
-public struct MattermostPost: Decodable, Sendable, Equatable, Identifiable {
+public struct MattermostPost: Codable, Sendable, Equatable, Identifiable {
   public let id: String
   public let userID: String
   public let channelID: String

@@ -12,6 +12,9 @@ struct RealtimeView: View {
         Spacer()
         Text("Latest 200 messages").foregroundStyle(.secondary)
       }
+      if let message = realtime.cacheMessage ?? realtime.storage?.notice {
+        Text(message).foregroundStyle(.secondary)
+      }
       Picker(
         "Channel",
         selection: Binding(

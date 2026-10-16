@@ -107,9 +107,11 @@ private actor RealtimeHTTP: HTTPTransport {
   var reactions: [String] = []
   var reactionRequests = 0
   var unauthorized = false
+  var forbidden = false
   func setPosts(_ posts: [String]) { self.posts = posts }
   func setReactions(_ reactions: [String]) { self.reactions = reactions }
   func expire() { unauthorized = true }
+  func deny() { forbidden = true }
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     let path = request.url!.path
     let json: String
@@ -137,7 +139,8 @@ private actor RealtimeHTTP: HTTPTransport {
     return HTTPResponse(
       data: Data(json.utf8),
       response: HTTPURLResponse(
-        url: request.url!, statusCode: unauthorized ? 401 : 200, httpVersion: nil, headerFields: nil
+        url: request.url!, statusCode: unauthorized ? 401 : (forbidden ? 403 : 200),
+        httpVersion: nil, headerFields: nil
       )!)
   }
 }
@@ -159,12 +162,78 @@ private func realtimeCredential() throws -> SessionCredential {
 
 @MainActor private func realtime(
   sockets: TestSocketTransport, http: RealtimeHTTP,
-  authentication: WebSocketAuthentication = .bearerHeader
+  authentication: WebSocketAuthentication = .bearerHeader,
+  storage: AccountPersistence? = nil
 ) -> RealtimeSession {
   RealtimeSession(
+    storage: storage,
     transport: sockets, authentication: authentication,
     makeClient: { try MattermostAPIClient(server: $0, transport: http, log: { _ in }) },
     sleep: { _ in try await Task.sleep(for: .milliseconds(10)) }, random: { 0.5 })
+}
+
+@Test @MainActor func realtimeCommitsSQLiteBeforePublishingAndRestoresCacheOffline() async throws {
+  var root = URL(fileURLWithPath: #filePath)
+  for _ in 0..<5 { root.deleteLastPathComponent() }
+  root.appendPathComponent("tmp/realtime-persistence/\(UUID().uuidString)")
+  let storage = AccountPersistence(root: root)
+  let credential = try realtimeCredential()
+  let account = SessionAccount(serverAddress: credential.serverAddress, userID: credential.userID)
+  try await storage.reconcile(for: account)
+  let socket = TestSocket()
+  socket.push(try eventBytes("hello"))
+  let session = realtime(
+    sockets: TestSocketTransport([socket]), http: RealtimeHTTP(), storage: storage)
+  session.start(credential: credential, unauthorized: {})
+  try await eventually { session.state == .connected }
+  let cache = try #require(storage.cache)
+  #expect(try await cache.checkpoint(channelID: "channel1") == session.synchronization.checkpoint)
+  socket.push(try eventBytes("post_edited", seq: 1, data: ["post": postJSON(revision: 20)]))
+  try await eventually { session.synchronization.posts.first?.updateAt == 20 }
+  #expect(try await cache.post(id: "post1")?.updateAt == 20)
+  session.stop()
+  let offline = RealtimeSession(
+    storage: storage,
+    makeClient: {
+      try MattermostAPIClient(server: $0, transport: OfflineCacheHTTP(), log: { _ in })
+    })
+  offline.start(credential: credential, unauthorized: {})
+  try await eventually { offline.state == .reconnecting }
+  #expect(offline.synchronization.posts.first?.updateAt == 20)
+  #expect(offline.synchronization.mentionPostIDs.isEmpty)
+  offline.stop()
+  try await storage.clear(for: account)
+}
+
+private struct OfflineCacheHTTP: HTTPTransport {
+  func send(_ request: URLRequest) async throws -> HTTPResponse { throw APIError.offline }
+}
+
+@Test @MainActor func permissionInvalidationPurgesPersistedContentBeforeFailedRecovery()
+  async throws
+{
+  var root = URL(fileURLWithPath: #filePath)
+  for _ in 0..<5 { root.deleteLastPathComponent() }
+  root.appendPathComponent("tmp/realtime-permissions/\(UUID().uuidString)")
+  let storage = AccountPersistence(root: root)
+  let credential = try realtimeCredential()
+  let account = SessionAccount(serverAddress: credential.serverAddress, userID: credential.userID)
+  try await storage.reconcile(for: account)
+  let http = RealtimeHTTP()
+  let socket = TestSocket()
+  socket.push(try eventBytes("hello"))
+  let session = realtime(sockets: TestSocketTransport([socket]), http: http, storage: storage)
+  session.start(credential: credential, unauthorized: {})
+  try await eventually { session.state == .connected }
+  await http.deny()
+  socket.push(try eventBytes("user_removed", seq: 1))
+  try await eventually { session.state == .reconnecting }
+  #expect(session.synchronization.posts.isEmpty)
+  #expect(session.synchronization.channels.isEmpty)
+  let cache = try #require(storage.cache)
+  #expect(try await cache.post(id: "post1") == nil)
+  session.stop()
+  try await storage.clear(for: account)
 }
 
 @Test func websocketURLPreservesDeploymentSubpathAndRequiresTLS() throws {

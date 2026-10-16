@@ -15,10 +15,14 @@ private struct AuthenticatedSocket: Sendable {
   let pending: [WebSocketEvent]
 }
 
+private enum MembershipInvalidation: Error { case refreshRequired }
+
 /// One app-owned connection, shared by all windows. All callbacks/imports carry a run fence.
 @MainActor @Observable public final class RealtimeSession {
   public private(set) var state: RealtimeConnectionState = .stopped
   public let synchronization = SynchronizationCoordinator()
+  public private(set) var cacheMessage: String?
+  public let storage: AccountPersistence?
 
   private let transport: any WebSocketTransport
   private let authentication: WebSocketAuthentication
@@ -35,6 +39,7 @@ private struct AuthenticatedSocket: Sendable {
   private var networkAvailable = true
 
   public init(
+    storage: AccountPersistence? = nil,
     transport: any WebSocketTransport = URLSessionWebSocketTransport(),
     authentication: WebSocketAuthentication = .bearerHeader,
     allowInsecureLocalhost: Bool = false,
@@ -46,6 +51,7 @@ private struct AuthenticatedSocket: Sendable {
     },
     random: @escaping @Sendable () -> Double = { Double.random(in: 0...1) }
   ) {
+    self.storage = storage
     self.transport = transport
     self.authentication = authentication
     self.allowInsecureLocalhost = allowInsecureLocalhost
@@ -70,6 +76,7 @@ private struct AuthenticatedSocket: Sendable {
     unauthorized = nil
     synchronization.reset()
     state = .stopped
+    cacheMessage = nil
   }
 
   public func selectChannel(_ id: String) {
@@ -123,6 +130,24 @@ private struct AuthenticatedSocket: Sendable {
   }
 
   private func run(_ credential: SessionCredential, current: UUID) async {
+    let cache = storage?.cache
+    do {
+      if let cache {
+        if synchronization.channels.isEmpty {
+          let snapshot = try await cache.snapshot()
+          guard isCurrent(current) else { return }
+          synchronization.restore(snapshot)
+        } else if let channelID = synchronization.selectedChannelID {
+          try await cache.selectChannel(channelID)
+          let snapshot = try await cache.snapshot()
+          guard isCurrent(current) else { return }
+          synchronization.restore(snapshot)
+        }
+      }
+    } catch {
+      guard isCurrent(current) else { return }
+      cacheMessage = "Could not read local cache. Reconnecting will retry."
+    }
     var failures = 0
     while isCurrent(current) {
       let connectedAt = Date()
@@ -134,6 +159,8 @@ private struct AuthenticatedSocket: Sendable {
         let user = try await client.currentUser(token: credential.token)
         guard isCurrent(current) else { return }
         guard user.id == credential.userID else { throw APIError.unauthorized }
+        try await storage?.cache?.saveIdentity(user, teams: [])
+        guard isCurrent(current) else { return }
         var request = URLRequest(url: try server.webSocketURL(), timeoutInterval: 15)
         request.httpShouldHandleCookies = false
         if authentication == .bearerHeader {
@@ -157,7 +184,17 @@ private struct AuthenticatedSocket: Sendable {
           callback?()
           return
         }
+        if error as? APIError == .forbidden || error is MembershipInvalidation {
+          synchronization.setChannels([])
+          do { try await storage?.invalidatePermissions() } catch {
+            cacheMessage = "Permission cleanup failed. Synchronization will retry."
+          }
+          guard isCurrent(current) else { return }
+        }
         if error as? WebSocketFailure == .capacityExceeded { synchronization.resetWindow() }
+        if error is PersistenceError {
+          cacheMessage = "Could not save local cache. Synchronization will retry."
+        }
         // Reset backoff only after a stable connection, never on a short-lived hello.
         if Date().timeIntervalSince(connectedAt) >= 60 { failures = 0 }
         state = .reconnecting
@@ -204,7 +241,11 @@ private struct AuthenticatedSocket: Sendable {
     state = .synchronizing
     synchronization.beginRecovery()
     for event in handshake.pending {
-      try synchronization.apply(event, origin: .recovery, userID: credential.userID)
+      try checkPermissions(event)
+      if try await persist(event, current: current) {
+        guard isCurrent(current) else { throw CancellationError() }
+        try synchronization.apply(event, origin: .recovery, userID: credential.userID)
+      }
     }
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
@@ -235,6 +276,9 @@ private struct AuthenticatedSocket: Sendable {
       guard isCurrent(current) else { return }
       guard try sequence.accept(event) else { continue }
       if event.event == "hello" { throw WebSocketFailure.sequenceGap }
+      try checkPermissions(event)
+      guard try await persist(event, current: current) else { continue }
+      guard isCurrent(current) else { return }
       let refresh = try synchronization.apply(
         event, origin: state == .connected ? .live : .recovery, userID: userID)
       if refresh { throw WebSocketFailure.sequenceGap }
@@ -250,6 +294,9 @@ private struct AuthenticatedSocket: Sendable {
       ticks += 1
       if ticks % 4 == 0 {
         try await withSocketDeadline(connection, seconds: 10) { try await connection.ping() }
+      }
+      if ticks % 720 == 0 {
+        await storage?.maintain(activeChannelID: synchronization.selectedChannelID)
       }
     }
   }
@@ -268,18 +315,83 @@ private struct AuthenticatedSocket: Sendable {
       guard isCurrent(current) else { throw CancellationError() }
     }
     guard isCurrent(current) else { throw CancellationError() }
+    let cache = storage?.cache
+    if let cache {
+      let user = try await client.currentUser(token: token)
+      guard isCurrent(current) else { throw CancellationError() }
+      try await cache.saveIdentity(user, teams: teams)
+    }
+    guard isCurrent(current) else { throw CancellationError() }
+    try await cache?.replaceChannels(Array(channels.values))
+    guard isCurrent(current) else { throw CancellationError() }
     synchronization.setChannels(Array(channels.values))
     if let ticket = synchronization.beginImport() {
+      try await cache?.selectChannel(ticket.channelID)
+      let priorIDs = Set(synchronization.posts.map(\.id))
+      let cacheTicket = try await cache?.beginImport() ?? .max
       let page = try await client.channelPosts(
         channelID: ticket.channelID, page: PostPage(size: 200), token: token)
       let reactions = try await recoverReactions(page, client: client, token: token)
-      guard isCurrent(current), synchronization.commit(page, reactions: reactions, ticket: ticket)
+      guard isCurrent(current) else { throw CancellationError() }
+      let checkpoint = UUID()
+      try await cache?.importPosts(
+        Array(page.posts.values), channelID: ticket.channelID,
+        checkpoint: checkpoint, authoritativeWindow: priorIDs, ticket: cacheTicket,
+        reactions: reactions)
+      var visiblePage = page
+      if let cache {
+        let stored = try await cache.recentPosts(channelID: ticket.channelID)
+        visiblePage = ChannelPosts(
+          order: stored.map(\.id),
+          posts: Dictionary(uniqueKeysWithValues: stored.map { ($0.id, $0) }))
+      }
+      guard isCurrent(current),
+        synchronization.commit(
+          visiblePage, reactions: reactions, ticket: ticket, checkpoint: checkpoint)
       else {
         throw CancellationError()
       }
     }
     guard isCurrent(current) else { throw CancellationError() }
     state = .connected
+    cacheMessage = nil
+  }
+
+  private func persist(_ event: WebSocketEvent, current: UUID) async throws -> Bool {
+    guard isCurrent(current) else { throw CancellationError() }
+    guard let cache = storage?.cache else { return true }
+    switch event.event {
+    case "posted", "post_edited", "post_deleted":
+      let post = try event.embedded(event.data?.post, as: MattermostPost.self)
+      let deleted = event.event == "post_deleted" || post.deleteAt > 0
+      try await cache.importPosts(
+        [post], channelID: post.channelID,
+        deletedIDs: deleted ? [post.id] : [])
+      if !deleted {
+        let accepted = try await cache.post(id: post.id)
+        return accepted == post
+      }
+    case "reaction_added", "reaction_removed":
+      let reaction = try event.embedded(event.data?.reaction, as: MattermostReaction.self)
+      if let channelID = synchronization.selectedChannelID,
+        synchronization.posts.contains(where: { $0.id == reaction.postID })
+      {
+        try await cache.applyReaction(
+          reaction, added: event.event == "reaction_added", channelID: channelID)
+      }
+    default: break
+    }
+    return true
+  }
+
+  private func checkPermissions(_ event: WebSocketEvent) throws {
+    if ["user_removed", "leave_team", "delete_team", "channel_deleted"].contains(event.event ?? "")
+    {
+      synchronization.setChannels([])
+      // Throw first to cancel and join concurrent REST work. Purge afterwards in the run loop,
+      // preventing an in-flight membership response from repopulating revoked cache content.
+      throw MembershipInvalidation.refreshRequired
+    }
   }
 
   private func recoverReactions(

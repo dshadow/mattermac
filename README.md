@@ -3,8 +3,10 @@
 A native, open-source Mattermost client for macOS, built with SwiftUI.
 The goal is a lightweight app for everyday messaging that feels at home on your Mac.
 
-**Early development:** the app currently opens a welcome window. Signing in,
-channels, and messaging are not available yet. It is not ready for daily use.
+**Early development:** native username/password sign-in, optional MFA, saved
+sessions and sign-out are available. A read-only channel picker shows the latest
+200 messages, with live edits, deletions, reactions and reconnect recovery.
+It is not ready for daily use.
 
 Mattermac is an independent project, not affiliated with Mattermost, Inc.
 
@@ -23,8 +25,24 @@ To build and try it, you need:
 3. Select the **Mattermac** scheme and **My Mac** destination.
 4. Choose **Product → Run** (`⌘R`).
 
-Local builds use ad hoc signing by default; a paid Apple Developer account is not
-required to try the app.
+Local builds use the stable self-signed `Mattermac Local` identity. Set up signing
+as described in the [signing guide](docs/signing.md); a paid Apple Developer
+account is not required. Keep the same identity for Keychain access across builds.
+
+Enter your server's HTTPS base URL, including any deployment subpath, then your
+Mattermost username or email and password. If MFA is enabled, enter a fresh
+authentication code. LDAP credentials are verified by your Mattermost server.
+SSO browser flows are not supported yet.
+
+The session token and account identity are stored in macOS Keychain; passwords
+and MFA codes are never saved. On reopening, the app verifies the saved session
+with the server. An expired session requires signing in to the same account.
+Sign out before switching accounts. Sign-out removes local credentials and
+attempts server revocation; if offline, server revocation cannot be confirmed.
+
+Choose a channel after signing in. Connection status shows when recent messages
+have recovered after a network interruption or wake. Messages stay in memory;
+older history, sending, attachments and desktop notifications are still planned.
 
 ## Development
 
@@ -70,6 +88,7 @@ formatter, describe your changes, and include screenshots for UI changes.
 - [Progress](PROGRESS.md): current work and validation results.
 - [Architecture decisions](DECISIONS.md): design choices and rationale.
 - [Signing guide](docs/signing.md): signing setup and credential persistence requirements.
+- [Real-time synchronization](docs/realtime.md): connection lifecycle and recovery boundaries.
 
 ## License
 

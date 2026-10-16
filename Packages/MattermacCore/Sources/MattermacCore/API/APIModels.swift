@@ -99,6 +99,7 @@ public struct MattermostPost: Decodable, Sendable, Equatable, Identifiable {
   public let createAt: Int64
   public let updateAt: Int64
   public let deleteAt: Int64
+  public let hasReactions: Bool?
 
   enum CodingKeys: String, CodingKey {
     case id, message
@@ -108,6 +109,7 @@ public struct MattermostPost: Decodable, Sendable, Equatable, Identifiable {
     case createAt = "create_at"
     case updateAt = "update_at"
     case deleteAt = "delete_at"
+    case hasReactions = "has_reactions"
   }
 }
 

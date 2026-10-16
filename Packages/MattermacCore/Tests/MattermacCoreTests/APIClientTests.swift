@@ -130,6 +130,21 @@ private func client(
   #expect(body == ["channel_id": "channel1", "message": "Synthetic post", "root_id": "root1"])
 }
 
+@Test func reactionReadsUseBearerAndTolerateEmptyServerLists() async throws {
+  let transport = ScriptedTransport([
+    .response(200, #"[{"user_id":"user1","post_id":"post1","emoji_name":"smile"}]"#),
+    .response(200, "null"),
+  ])
+  let api = try client(transport)
+  let token = try SessionToken("syntheticToken")
+  #expect(try await api.postReactions(postID: "post1", token: token).first?.emojiName == "smile")
+  #expect(try await api.postReactions(postID: "post1", token: token).isEmpty)
+  let request = try #require(await transport.requests.first)
+  #expect(request.url?.path == "/mattermost/api/v4/posts/post1/reactions")
+  #expect(request.httpMethod == "GET")
+  #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer syntheticToken")
+}
+
 @Test(arguments: [301, 304, 400, 401, 403, 404, 429, 500, 503])
 func statusFailuresAreTypedAndSanitized(status: Int) async throws {
   let transport = ScriptedTransport([

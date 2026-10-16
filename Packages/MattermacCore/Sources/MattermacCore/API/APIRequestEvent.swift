@@ -1,7 +1,7 @@
 import OSLog
 
 public enum APIOperation: String, Sendable {
-  case login, logout, currentUser, teams, channels, channelPosts, createPost
+  case login, logout, currentUser, teams, channels, channelPosts, createPost, postReactions
 }
 
 /// Fixed operation names and numeric metadata only. No account or server identifiers.

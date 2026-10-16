@@ -75,6 +75,14 @@ public struct MattermostAPIClient: Sendable {
     try decode(await send(.createPost, path: ["posts"], token: token, body: encode(post)))
   }
 
+  public func postReactions(postID: String, token: SessionToken) async throws
+    -> [MattermostReaction]
+  {
+    let reactions: [MattermostReaction]? = try decode(
+      await send(.postReactions, path: ["posts", postID, "reactions"], token: token))
+    return reactions ?? []
+  }
+
   private func encode(_ body: some Encodable) throws -> Data {
     do { return try JSONEncoder().encode(body) } catch { throw APIError.encodingFailed }
   }

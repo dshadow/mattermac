@@ -27,18 +27,18 @@ struct AuthenticationView: View {
           }
         }
       case .authenticated:
-        VStack(alignment: .leading, spacing: 16) {
-          Text("Signed in as \(session.user?.username ?? "")")
-            .font(.title2)
-          Text(session.serverAddress).foregroundStyle(.secondary)
-          if let realtime = session.realtime { RealtimeView(realtime: realtime) }
-          if let message = session.message { Text(message).foregroundStyle(.secondary) }
-          Button("Check Session") { Task { await session.verify() } }
-            .disabled(session.isBusy)
+        if let realtime = session.realtime {
+          WorkspaceView(
+            realtime: realtime, user: session.user, serverAddress: session.serverAddress
+          )
+          .safeAreaInset(edge: .bottom) {
+            if let message = session.message {
+              Text(message).foregroundStyle(.secondary).padding(8)
+            }
+          }
         }
       }
     }
-    .padding(32)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .toolbar {
       if session.phase != .starting && session.phase != .signedOut {

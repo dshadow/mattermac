@@ -4,8 +4,11 @@ A native, open-source Mattermost client for macOS, built with SwiftUI.
 The goal is a lightweight app for everyday messaging that feels at home on your Mac.
 
 **Early development:** native username/password sign-in, optional MFA, saved
-sessions and sign-out are available. A read-only channel picker shows the latest
-200 messages, with live edits, deletions, reactions and reconnect recovery. Recent
+sessions and sign-out are available. Native team and channel sidebars show public,
+private, direct and group conversations with unread and mention indicators. The
+read-only timeline opens recent messages and loads older history as you scroll,
+with author names, avatars, timestamps, grouped messages, essential Markdown,
+live edits, deletions, reactions and reconnect recovery. Recent
 messages are cached across restarts, with configurable retention in Settings.
 It is not ready for daily use.
 
@@ -41,13 +44,24 @@ with the server. An expired session requires signing in to the same account.
 Sign out before switching accounts. Sign-out removes local credentials and
 attempts server revocation; if offline, server revocation cannot be confirmed.
 
-Choose a channel after signing in. Connection status shows when recent messages
+Choose a team, then a channel or direct message after signing in. Your selected
+channel is restored after restart. Use the Conversation menu for keyboard navigation:
+Option-Command-1 focuses teams, Option-Command-2 focuses channels, and
+Option-Command-Up/Down switches conversations. Arrow keys navigate each sidebar.
+Sidebars resize and collapse using standard macOS controls; appearance follows macOS.
+Unread and mention indicators reflect server state. Opening a conversation does not
+yet mark it read; read acknowledgements are planned with messaging synchronization.
+Use Reconnect to retry failed loading. Connection status shows when recent messages
 have recovered after a network interruption or wake. Previously opened messages
 load from local cache after session verification, followed by server updates.
 Settings defaults to 30 days of inactive cache retention. Local data relies on
 macOS permissions and your FileVault settings; it is not independently encrypted.
-Sign-out removes account cache and unsent work after confirmation. Older history,
-sending, attachments and desktop notifications are still planned.
+Sign-out removes account cache and unsent work after confirmation.
+Scroll upward or choose Load older messages to read history. The timeline keeps
+a bounded window; choose Latest messages to return to the live end. New messages
+wait behind that button while you read older posts. Links, inline and fenced code,
+and mentions render natively; remote Markdown images are not fetched.
+Sending, threads, attachments and desktop notifications are still planned.
 
 ## Development
 

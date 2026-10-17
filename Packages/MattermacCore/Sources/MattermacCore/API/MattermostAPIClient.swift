@@ -70,6 +70,27 @@ public struct MattermostAPIClient: Sendable {
         .channelPosts, path: ["channels", channelID, "posts"], query: page.query, token: token))
   }
 
+  public func olderPosts(channelID: String, before postID: String, token: SessionToken)
+    async throws -> ChannelPosts
+  {
+    guard !postID.isEmpty else { throw APIError.invalidPagination }
+    let page: ChannelPosts = try decode(
+      await send(
+        .channelPosts, path: ["channels", channelID, "posts"],
+        query: [
+          URLQueryItem(name: "before", value: postID),
+          URLQueryItem(name: "per_page", value: "100"),
+        ], token: token))
+    guard page.posts.count <= 200 else { throw APIError.decodingFailed }
+    return page
+  }
+
+  public func avatar(userID: String, token: SessionToken) async throws -> Data {
+    let response = try await send(.avatar, path: ["users", userID, "image"], token: token)
+    guard response.data.count <= 262_144 else { throw APIError.decodingFailed }
+    return response.data
+  }
+
   /// Never automatically replay a send: a lost response can still mean the post was created.
   public func createPost(_ post: CreatePost, token: SessionToken) async throws -> MattermostPost {
     try decode(await send(.createPost, path: ["posts"], token: token, body: encode(post)))
@@ -81,6 +102,23 @@ public struct MattermostAPIClient: Sendable {
     let reactions: [MattermostReaction]? = try decode(
       await send(.postReactions, path: ["posts", postID, "reactions"], token: token))
     return reactions ?? []
+  }
+
+  public func channelMemberships(teamID: String, token: SessionToken) async throws
+    -> [NavigationMembership]
+  {
+    try decode(
+      await send(
+        .channelMemberships,
+        path: ["users", "me", "teams", teamID, "channels", "members"], token: token))
+  }
+
+  public func users(ids: [String], token: SessionToken) async throws -> [MattermostUser] {
+    guard !ids.isEmpty, ids.count <= 200 else { throw APIError.invalidConfiguration }
+    return try decode(
+      await send(
+        .usersByIDs, path: ["users", "ids"], token: token,
+        body: encode(ids)))
   }
 
   private func encode(_ body: some Encodable) throws -> Data {
@@ -102,9 +140,10 @@ public struct MattermostAPIClient: Sendable {
     var request = URLRequest(
       url: try server.url(path: path, query: query),
       cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: requestTimeout)
-    request.httpMethod = isRead ? "GET" : "POST"
+    request.httpMethod = isRead && operation != .usersByIDs ? "GET" : "POST"
     request.httpShouldHandleCookies = false
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(
+      operation == .avatar ? "image/png" : "application/json", forHTTPHeaderField: "Accept")
     if let token { request.setValue("Bearer " + token.value, forHTTPHeaderField: "Authorization") }
     if let body {
       request.httpBody = body

@@ -26,6 +26,9 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
   public private(set) var notificationRevision: UInt64 = 0
   public private(set) var mentionPostIDs: [String] = []
   public private(set) var checkpoint: UUID?
+  public private(set) var isBrowsingHistory = false
+  public private(set) var arrivalRevision: UInt64 = 0
+  public private(set) var hasDeferredMessages = false
 
   private var generation = UUID()
   private var windowGeneration = UUID()
@@ -35,6 +38,11 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
   private var mutations: [String: UInt64] = [:]
   private var notified: Set<String> = []
   private var reactionMutations: [MattermostReaction: UInt64] = [:]
+  private var pausedReaders: Set<UUID> = []
+
+  public func followLatest(_ following: Bool, reader: UUID) {
+    if following { pausedReaders.remove(reader) } else { pausedReaders.insert(reader) }
+  }
 
   public init() {}
 
@@ -78,6 +86,10 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
     reactions = []
     reactionMutations = [:]
     checkpoint = nil
+    isBrowsingHistory = false
+    arrivalRevision = 0
+    hasDeferredMessages = false
+    pausedReaders = []
   }
 
   func setChannels(_ incoming: [MattermostChannel]) {
@@ -132,6 +144,8 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
       if let post = values[id], !tombstones.contains(id) { imported[id] = post }
     }
     values = imported
+    isBrowsingHistory = false
+    hasDeferredMessages = false
     var recoveredReactions = Set(baseline.filter { values[$0.postID] != nil })
     for (reaction, counter) in reactionMutations where counter > ticket.mutation {
       if reactionChanges[reaction] == true {
@@ -148,6 +162,28 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
     return true
   }
 
+  /// Older-page imports retain concurrent edits/deletions and evict from the newest edge.
+  @discardableResult func prepend(_ page: ChannelPosts, ticket: ImportTicket) -> Bool {
+    guard ticket.generation == generation, ticket.window == windowGeneration,
+      ticket.channelID == selectedChannelID
+    else { return false }
+    isBrowsingHistory = true
+    for post in page.posts.values where post.channelID == ticket.channelID {
+      if post.deleteAt > 0 {
+        guard tombstones.count < 2_000 || tombstones.contains(post.id) else { return false }
+        tombstones.insert(post.id)
+        values[post.id] = nil
+        continue
+      }
+      guard !tombstones.contains(post.id), post.deleteAt == 0 else { continue }
+      if let previous = values[post.id], previous.updateAt >= post.updateAt { continue }
+      values[post.id] = post
+      rememberNotification(post.id)
+    }
+    publish()
+    return true
+  }
+
   /// Returns true when membership/channel metadata requires authoritative REST refresh.
   @discardableResult func apply(
     _ event: WebSocketEvent, origin: SynchronizationOrigin, userID: String, now: Date = Date()
@@ -156,6 +192,7 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
     switch name {
     case "posted", "post_edited", "post_deleted":
       let post = try event.embedded(event.data?.post, as: MattermostPost.self)
+      let known = notified.contains(post.id)
       guard !post.id.isEmpty, !post.channelID.isEmpty else {
         throw WebSocketFailure.malformedMessage
       }
@@ -171,6 +208,14 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
         }
       }
       guard post.channelID == selectedChannelID else { return false }
+      if name == "posted", values[post.id] == nil, !tombstones.contains(post.id) {
+        if !known, origin == .live { arrivalRevision &+= 1 }
+        if isBrowsingHistory || !pausedReaders.isEmpty {
+          hasDeferredMessages = true
+          return false
+        }
+      }
+      if name == "post_edited", isBrowsingHistory, values[post.id] == nil { return false }
       if name == "post_deleted" || post.deleteAt > 0 {
         guard tombstones.count < 2_000 || tombstones.contains(post.id) else {
           throw WebSocketFailure.capacityExceeded
@@ -241,9 +286,8 @@ public struct MattermostReaction: Codable, Sendable, Hashable {
   }
 
   private func publish() {
-    posts = Array(
-      values.values.sorted { ($0.createAt, $0.id) > ($1.createAt, $1.id) }.prefix(200)
-    ).reversed()
+    let sorted = values.values.sorted { ($0.createAt, $0.id) < ($1.createAt, $1.id) }
+    posts = isBrowsingHistory ? Array(sorted.prefix(400)) : Array(sorted.suffix(200))
     values = Dictionary(uniqueKeysWithValues: posts.map { ($0.id, $0) })
     reactionChanges = reactionChanges.filter { values[$0.key.postID] != nil }
     reactionMutations = reactionMutations.filter { values[$0.key.postID] != nil }

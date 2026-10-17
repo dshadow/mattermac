@@ -108,10 +108,23 @@ private actor RealtimeHTTP: HTTPTransport {
   var reactionRequests = 0
   var unauthorized = false
   var forbidden = false
+  var mentions = 2
+  var older: [String] = []
+  var historyRequests = 0
+  var historyFailure = false
+  var delayHistory = false
+  var denyHistory = false
+  func setOlder(_ posts: [String], fail: Bool = false, delay: Bool = false, deny: Bool = false) {
+    older = posts
+    historyFailure = fail
+    delayHistory = delay
+    denyHistory = deny
+  }
   func setPosts(_ posts: [String]) { self.posts = posts }
   func setReactions(_ reactions: [String]) { self.reactions = reactions }
   func expire() { unauthorized = true }
   func deny() { forbidden = true }
+  func setMentions(_ value: Int) { mentions = value }
   func send(_ request: URLRequest) async throws -> HTTPResponse {
     let path = request.url!.path
     let json: String
@@ -124,15 +137,29 @@ private actor RealtimeHTTP: HTTPTransport {
     } else if path.hasSuffix("/channels") {
       json =
         #"[{"id":"channel1","team_id":"team1","name":"test","display_name":"Test","type":"O"}]"#
+    } else if path.hasSuffix("/channels/members") {
+      json = "[{\"channel_id\":\"channel1\",\"msg_count\":0,\"mention_count\":\(mentions)}]"
     } else if path.hasSuffix("/reactions") {
       reactionRequests += 1
       json = "[" + reactions.joined(separator: ",") + "]"
     } else if path.hasSuffix("/posts") {
-      let objects = try posts.map {
+      let history = request.url?.query?.contains("before=") == true
+      if history {
+        historyRequests += 1
+        if delayHistory { try? await Task.sleep(for: .milliseconds(100)) }
+        if historyFailure { throw APIError.offline }
+        if denyHistory { throw APIError.forbidden }
+      }
+      let source = history ? older : posts
+      let objects = try source.map {
         try JSONDecoder().decode(MattermostPost.self, from: Data($0.utf8))
       }
-      let entries = zip(objects, posts).map { "\"\($0.0.id)\":\($0.1)" }.joined(separator: ",")
+      let entries = zip(objects, source).map { "\"\($0.0.id)\":\($0.1)" }.joined(separator: ",")
       json = "{\"order\":[],\"posts\":{\(entries)}}"
+    } else if path.hasSuffix("/users/ids") {
+      json = #"[{"id":"other","username":"synthetic"}]"#
+    } else if path.hasSuffix("/image") {
+      json = "synthetic-image"
     } else {
       throw APIError.invalidResponse
     }
@@ -172,6 +199,111 @@ private func realtimeCredential() throws -> SessionCredential {
     sleep: { _ in try await Task.sleep(for: .milliseconds(10)) }, random: { 0.5 })
 }
 
+@Test @MainActor func historyPagingRetriesAndFencesLateResponsesAfterStop() async throws {
+  let socket = TestSocket()
+  socket.push(try eventBytes("hello"))
+  let http = RealtimeHTTP()
+  let session = realtime(sockets: TestSocketTransport([socket]), http: http)
+  session.start(credential: try realtimeCredential(), unauthorized: {})
+  try await eventually { session.state == .connected }
+  let older = postJSON("older").replacingOccurrences(of: "\"create_at\":1", with: "\"create_at\":0")
+  await http.setOlder([older], fail: true)
+  session.loadOlderMessages()
+  try await eventually { session.historyMessage != nil }
+  #expect(session.synchronization.posts.count == 1)
+  #expect(session.hasOlderMessages)
+  await http.setOlder([older])
+  session.loadOlderMessages()
+  session.loadOlderMessages()
+  try await eventually { !session.isLoadingHistory }
+  #expect(session.historyMessage == nil)
+  #expect(session.synchronization.posts.map(\.id) == ["older", "post1"])
+  #expect(await http.historyRequests == 2)
+  await session.loadAuthor("other")
+  #expect(session.authors["other"]?.username == "synthetic")
+  #expect(session.avatars["other"] != nil)
+  await http.setOlder([], delay: true)
+  session.loadOlderMessages()
+  try await Task.sleep(for: .milliseconds(10))
+  session.stop()
+  try await Task.sleep(for: .milliseconds(150))
+  #expect(session.synchronization.posts.isEmpty)
+  #expect(session.authors.isEmpty)
+  #expect(session.avatars.isEmpty)
+  #expect(session.historyMessage == nil)
+  #expect(!session.isLoadingHistory)
+}
+
+@Test @MainActor func historyExhaustionStopsFurtherRequests() async throws {
+  let socket = TestSocket()
+  socket.push(try eventBytes("hello"))
+  let http = RealtimeHTTP()
+  let session = realtime(sockets: TestSocketTransport([socket]), http: http)
+  defer { session.stop() }
+  session.start(credential: try realtimeCredential(), unauthorized: {})
+  try await eventually { session.state == .connected }
+  session.loadOlderMessages()
+  try await eventually { !session.isLoadingHistory }
+  #expect(!session.hasOlderMessages)
+  session.loadOlderMessages()
+  #expect(await http.historyRequests == 1)
+}
+
+@Test @MainActor func forbiddenHistoryJoinsRunBeforeClearingVisibleAccountData() async throws {
+  let socket = TestSocket()
+  socket.push(try eventBytes("hello"))
+  let http = RealtimeHTTP()
+  let session = RealtimeSession(
+    transport: TestSocketTransport([socket]),
+    makeClient: { try MattermostAPIClient(server: $0, transport: http, log: { _ in }) },
+    sleep: { _ in try await Task.sleep(for: .seconds(60)) })
+  defer { session.stop() }
+  session.start(credential: try realtimeCredential(), unauthorized: {})
+  try await eventually { session.state == .connected }
+  await session.loadAuthor("other")
+  #expect(!session.authors.isEmpty)
+  await http.setOlder([], deny: true)
+  session.loadOlderMessages()
+  try await eventually { session.state == .reconnecting }
+  #expect(socket.closed)
+  #expect(session.synchronization.posts.isEmpty)
+  #expect(session.synchronization.channels.isEmpty)
+  #expect(session.authors.isEmpty)
+  #expect(session.avatars.isEmpty)
+}
+
+@Test @MainActor func historyPublicationUsesDurableRevisionsAndTombstones() async throws {
+  var root = URL(fileURLWithPath: #filePath)
+  for _ in 0..<5 { root.deleteLastPathComponent() }
+  root.appendPathComponent("tmp/timeline-persistence/\(UUID().uuidString)")
+  let storage = AccountPersistence(root: root)
+  let credential = try realtimeCredential()
+  let account = SessionAccount(serverAddress: credential.serverAddress, userID: credential.userID)
+  try await storage.reconcile(for: account)
+  let http = RealtimeHTTP()
+  let socket = TestSocket()
+  socket.push(try eventBytes("hello"))
+  let session = realtime(sockets: TestSocketTransport([socket]), http: http, storage: storage)
+  session.start(credential: credential, unauthorized: {})
+  try await eventually { session.state == .connected }
+  let cache = try #require(storage.cache)
+  let stale = postJSON("older").replacingOccurrences(of: "\"create_at\":1", with: "\"create_at\":0")
+  let edited = stale.replacingOccurrences(of: "\"update_at\":10", with: "\"update_at\":50")
+  let deleted = stale.replacingOccurrences(of: "older", with: "deleted")
+  try await cache.importPosts(
+    [
+      JSONDecoder().decode(MattermostPost.self, from: Data(edited.utf8)),
+      JSONDecoder().decode(MattermostPost.self, from: Data(deleted.utf8)),
+    ], channelID: "channel1", deletedIDs: ["deleted"])
+  await http.setOlder([stale, deleted])
+  session.loadOlderMessages()
+  try await eventually { !session.isLoadingHistory }
+  #expect(session.synchronization.posts.first { $0.id == "older" }?.updateAt == 50)
+  #expect(!session.synchronization.posts.contains { $0.id == "deleted" })
+  session.stop()
+  try await storage.clear(for: account)
+}
+
 @Test @MainActor func realtimeCommitsSQLiteBeforePublishingAndRestoresCacheOffline() async throws {
   var root = URL(fileURLWithPath: #filePath)
   for _ in 0..<5 { root.deleteLastPathComponent() }
@@ -201,8 +333,27 @@ private func realtimeCredential() throws -> SessionCredential {
   try await eventually { offline.state == .reconnecting }
   #expect(offline.synchronization.posts.first?.updateAt == 20)
   #expect(offline.synchronization.mentionPostIDs.isEmpty)
+  #expect(offline.navigation.teams.map(\.id) == ["team1"])
+  #expect(offline.synchronization.selectedChannelID == "channel1")
   offline.stop()
   try await storage.clear(for: account)
+}
+
+@Test @MainActor func sidebarMetadataRecoversAndClearsOnStop() async throws {
+  let socket = TestSocket()
+  socket.push(try eventBytes("hello"))
+  let http = RealtimeHTTP()
+  let session = realtime(sockets: TestSocketTransport([socket]), http: http)
+  session.start(credential: try realtimeCredential(), unauthorized: {})
+  try await eventually { session.navigation.badges["channel1"]?.mentions == 2 }
+  #expect(session.navigation.teams.map(\.id) == ["team1"])
+  #expect(session.navigationMessage == nil)
+  await http.setMentions(0)
+  socket.push(try eventBytes("channel_viewed", seq: 1))
+  try await eventually { session.navigation.badges["channel1"]?.mentions == 0 }
+  session.stop()
+  #expect(session.navigation.teams.isEmpty)
+  #expect(session.navigation.badges.isEmpty)
 }
 
 private struct OfflineCacheHTTP: HTTPTransport {
@@ -230,6 +381,8 @@ private struct OfflineCacheHTTP: HTTPTransport {
   try await eventually { session.state == .reconnecting }
   #expect(session.synchronization.posts.isEmpty)
   #expect(session.synchronization.channels.isEmpty)
+  #expect(session.navigation.teams.isEmpty)
+  #expect(session.navigation.badges.isEmpty)
   let cache = try #require(storage.cache)
   #expect(try await cache.post(id: "post1") == nil)
   session.stop()

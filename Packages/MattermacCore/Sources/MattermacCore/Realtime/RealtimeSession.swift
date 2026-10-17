@@ -23,6 +23,21 @@ private enum MembershipInvalidation: Error { case refreshRequired }
   public let synchronization = SynchronizationCoordinator()
   public private(set) var cacheMessage: String?
   public let storage: AccountPersistence?
+  public private(set) var navigation = NavigationSnapshot()
+  public private(set) var navigationMessage: String?
+  public private(set) var isLoadingNavigation = false
+  public private(set) var isLoadingHistory = false
+  public private(set) var hasOlderMessages = true
+  public private(set) var historyMessage: String?
+  public private(set) var authors: [String: MattermostUser] = [:]
+  public private(set) var avatars: [String: Data] = [:]
+  private var historyWorker: Task<Void, Never>?
+  private var historyTaskID: UUID?
+  private var historyCursor: String?
+  private var historyPermissionDenied = false
+  private var authorRequests: Set<String> = []
+  private var authorOrder: [String] = []
+  private var authorGeneration = UUID()
 
   private let transport: any WebSocketTransport
   private let authentication: WebSocketAuthentication
@@ -33,6 +48,9 @@ private enum MembershipInvalidation: Error { case refreshRequired }
   private var credential: SessionCredential?
   private var unauthorized: (@MainActor () -> Void)?
   private var worker: Task<Void, Never>?
+  private var navigationWorker: Task<Void, Never>?
+  private var navigationTaskID: UUID?
+  private var navigationRevision: UInt64 = 0
   private var socket: (any WebSocketConnection)?
   private var runID = UUID()
   private var sleeping = false
@@ -77,6 +95,12 @@ private enum MembershipInvalidation: Error { case refreshRequired }
     synchronization.reset()
     state = .stopped
     cacheMessage = nil
+    navigation = NavigationSnapshot()
+    navigationMessage = nil
+    authors = [:]
+    avatars = [:]
+    authorRequests = []
+    authorOrder = []
   }
 
   public func selectChannel(_ id: String) {
@@ -85,6 +109,117 @@ private enum MembershipInvalidation: Error { case refreshRequired }
     else { return }
     synchronization.selectChannel(id)
     restart()
+  }
+
+  public func retry() { restart() }
+
+  public func showRecentMessages() {
+    synchronization.resetWindow()
+    restart()
+  }
+
+  public func loadOlderMessages() {
+    guard !isLoadingHistory, hasOlderMessages, state == .connected,
+      let credential, let ticket = synchronization.beginImport(),
+      let oldest = synchronization.posts.first
+    else { return }
+    let current = runID
+    let cursor = historyCursor ?? oldest.id
+    let taskID = UUID()
+    historyTaskID = taskID
+    isLoadingHistory = true
+    historyMessage = nil
+    historyWorker = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        if current == runID, historyTaskID == taskID {
+          isLoadingHistory = false
+          historyWorker = nil
+          historyTaskID = nil
+        }
+      }
+      do {
+        let server = try MattermostServer(
+          credential.serverAddress, allowInsecureLocalhost: allowInsecureLocalhost)
+        let client = try makeClient(server)
+        var page = try await client.olderPosts(
+          channelID: ticket.channelID, before: cursor, token: credential.token)
+        guard isCurrent(current) else { return }
+        let oldestIncoming = page.posts.values.filter {
+          $0.channelID == ticket.channelID && ($0.createAt, $0.id) < (oldest.createAt, oldest.id)
+        }.min { ($0.createAt, $0.id) < ($1.createAt, $1.id) }
+        try await storage?.cache?.importPosts(
+          Array(page.posts.values), channelID: ticket.channelID)
+        if let cache = storage?.cache {
+          let accepted = try await cache.posts(
+            ids: Array(page.posts.keys), channelID: ticket.channelID)
+          page = ChannelPosts(
+            order: accepted.map(\.id),
+            posts: Dictionary(uniqueKeysWithValues: accepted.map { ($0.id, $0) }))
+        }
+        guard isCurrent(current) else { return }
+        if synchronization.prepend(page, ticket: ticket) {
+          hasOlderMessages = oldestIncoming != nil && oldestIncoming?.id != cursor
+          historyCursor = oldestIncoming?.id
+        }
+      } catch {
+        guard isCurrent(current) else { return }
+        if error as? APIError == .unauthorized {
+          let callback = unauthorized
+          stop()
+          callback?()
+        } else if error as? APIError == .forbidden {
+          // Closing the socket joins concurrent REST/event work before the run loop purges cache.
+          historyPermissionDenied = true
+          socket?.cancel()
+        } else {
+          historyMessage = "Could not load older messages. Try again."
+        }
+      }
+    }
+  }
+
+  /// Called by visible rows only. No avatar disk cache or third-party image requests.
+  public func loadAuthor(_ id: String) async {
+    let current = runID
+    let generation = authorGeneration
+    while authorRequests.count >= 4 {
+      do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+      guard isCurrent(current), generation == authorGeneration else { return }
+    }
+    guard !id.isEmpty, authors[id] == nil, !authorRequests.contains(id),
+      let credential, isCurrent(current)
+    else { return }
+    authorRequests.insert(id)
+    defer { if current == runID, generation == authorGeneration { authorRequests.remove(id) } }
+    do {
+      let server = try MattermostServer(
+        credential.serverAddress, allowInsecureLocalhost: allowInsecureLocalhost)
+      let client = try makeClient(server)
+      let users = try await client.users(ids: [id], token: credential.token)
+      guard let user = users.first(where: { $0.id == id }) else { return }
+      let avatar: Data?
+      do { avatar = try await client.avatar(userID: id, token: credential.token) } catch {
+        if error as? APIError == .unauthorized { throw error }
+        avatar = nil
+      }
+      guard isCurrent(current), generation == authorGeneration else { return }
+      if authors.count >= 64, let oldest = authorOrder.first {
+        authorOrder.removeFirst()
+        authors[oldest] = nil
+        avatars[oldest] = nil
+      }
+      authors[id] = user
+      avatars[id] = avatar
+      authorOrder.append(id)
+    } catch {
+      guard isCurrent(current), generation == authorGeneration else { return }
+      if error as? APIError == .unauthorized {
+        let callback = unauthorized
+        stop()
+        callback?()
+      }
+    }
   }
 
   public func suspend() {
@@ -107,6 +242,20 @@ private enum MembershipInvalidation: Error { case refreshRequired }
     runID = UUID()
     worker?.cancel()
     worker = nil
+    navigationWorker?.cancel()
+    navigationWorker = nil
+    navigationTaskID = nil
+    isLoadingNavigation = false
+    historyWorker?.cancel()
+    historyWorker = nil
+    historyTaskID = nil
+    isLoadingHistory = false
+    hasOlderMessages = true
+    historyCursor = nil
+    historyPermissionDenied = false
+    historyMessage = nil
+    authorRequests = []
+    authorGeneration = UUID()
     socket?.cancel()
     socket = nil
   }
@@ -137,6 +286,9 @@ private enum MembershipInvalidation: Error { case refreshRequired }
           let snapshot = try await cache.snapshot()
           guard isCurrent(current) else { return }
           synchronization.restore(snapshot)
+          let teams = try await cache.teams()
+          guard isCurrent(current) else { return }
+          navigation.teams = teams.sorted { ($0.displayName, $0.id) < ($1.displayName, $1.id) }
         } else if let channelID = synchronization.selectedChannelID {
           try await cache.selectChannel(channelID)
           let snapshot = try await cache.snapshot()
@@ -176,16 +328,33 @@ private enum MembershipInvalidation: Error { case refreshRequired }
         }
       } catch {
         guard isCurrent(current) else { return }
+        historyWorker?.cancel()
+        historyWorker = nil
+        historyTaskID = nil
+        isLoadingHistory = false
         socket?.cancel()
         socket = nil
+        navigationWorker?.cancel()
+        navigationWorker = nil
+        navigationTaskID = nil
+        isLoadingNavigation = false
         if error as? APIError == .unauthorized {
           let callback = unauthorized
           stop()
           callback?()
           return
         }
-        if error as? APIError == .forbidden || error is MembershipInvalidation {
+        if error as? APIError == .forbidden || error is MembershipInvalidation
+          || historyPermissionDenied
+        {
+          historyPermissionDenied = false
+          authorGeneration = UUID()
+          authors = [:]
+          avatars = [:]
+          authorOrder = []
+          authorRequests = []
           synchronization.setChannels([])
+          navigation = NavigationSnapshot()
           do { try await storage?.invalidatePermissions() } catch {
             cacheMessage = "Permission cleanup failed. Synchronization will retry."
           }
@@ -281,6 +450,12 @@ private enum MembershipInvalidation: Error { case refreshRequired }
       guard isCurrent(current) else { return }
       let refresh = try synchronization.apply(
         event, origin: state == .connected ? .live : .recovery, userID: userID)
+      if [
+        "posted", "post_deleted", "channel_viewed", "multiple_channels_viewed", "post_unread",
+        "thread_read_changed",
+      ].contains(event.event ?? "") {
+        scheduleNavigationRefresh(current: current)
+      }
       if refresh { throw WebSocketFailure.sequenceGap }
     }
   }
@@ -325,6 +500,7 @@ private enum MembershipInvalidation: Error { case refreshRequired }
     try await cache?.replaceChannels(Array(channels.values))
     guard isCurrent(current) else { throw CancellationError() }
     synchronization.setChannels(Array(channels.values))
+    navigation.teams = teams.sorted { ($0.displayName, $0.id) < ($1.displayName, $1.id) }
     if let ticket = synchronization.beginImport() {
       try await cache?.selectChannel(ticket.channelID)
       let priorIDs = Set(synchronization.posts.map(\.id))
@@ -355,6 +531,78 @@ private enum MembershipInvalidation: Error { case refreshRequired }
     guard isCurrent(current) else { throw CancellationError() }
     state = .connected
     cacheMessage = nil
+    scheduleNavigationRefresh(current: current)
+  }
+
+  /// Coalesce event bursts; an event arriving during a request gets another authoritative pass.
+  private func scheduleNavigationRefresh(current: UUID) {
+    navigationRevision &+= 1
+    guard navigationWorker == nil, let credential else { return }
+    let taskID = UUID()
+    navigationTaskID = taskID
+    navigationWorker = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        if current == runID, navigationTaskID == taskID {
+          navigationWorker = nil
+          navigationTaskID = nil
+          isLoadingNavigation = false
+        }
+      }
+      while isCurrent(current) {
+        let revision = navigationRevision
+        do {
+          try await Task.sleep(for: .milliseconds(500))
+          guard isCurrent(current) else { return }
+          isLoadingNavigation = true
+          let server = try MattermostServer(
+            credential.serverAddress, allowInsecureLocalhost: allowInsecureLocalhost)
+          let client = try makeClient(server)
+          var snapshot = NavigationSnapshot()
+          snapshot.teams = navigation.teams
+          for team in snapshot.teams {
+            let channels = try await client.channels(teamID: team.id, token: credential.token)
+            let members = try await client.channelMemberships(
+              teamID: team.id, token: credential.token)
+            let indexed = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            for member in members {
+              if let channel = indexed[member.channelID] {
+                snapshot.badges[channel.id] = NavigationSnapshot.badge(
+                  channel: channel, member: member)
+              }
+            }
+            guard isCurrent(current) else { return }
+          }
+          let ids = Array(
+            Set(
+              synchronization.channels.filter { $0.type == "D" }
+                .flatMap { $0.name.components(separatedBy: "__") }
+                .filter { !$0.isEmpty && $0 != credential.userID })
+          ).sorted()
+          for offset in stride(from: 0, to: ids.count, by: 200) {
+            let batch = Array(ids[offset..<min(offset + 200, ids.count)])
+            for user in try await client.users(ids: batch, token: credential.token) {
+              snapshot.users[user.id] = user
+            }
+            guard isCurrent(current) else { return }
+          }
+          guard isCurrent(current) else { return }
+          navigation = snapshot
+          navigationMessage = nil
+        } catch {
+          guard isCurrent(current) else { return }
+          if error as? APIError == .unauthorized {
+            let callback = unauthorized
+            stop()
+            callback?()
+            return
+          }
+          navigationMessage =
+            "Could not refresh unread counts or conversation names. Retry to reconnect."
+        }
+        if revision == navigationRevision { return }
+      }
+    }
   }
 
   private func persist(_ event: WebSocketEvent, current: UUID) async throws -> Bool {

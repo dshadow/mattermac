@@ -81,11 +81,13 @@ public struct MattermostChannel: Codable, Sendable, Equatable, Identifiable {
   public let displayName: String
   /// Keep unknown future channel types decodable.
   public let type: String
+  public var totalMsgCount: Int? = nil
 
   enum CodingKeys: String, CodingKey {
     case id, name, type
     case teamID = "team_id"
     case displayName = "display_name"
+    case totalMsgCount = "total_msg_count"
   }
 }
 
@@ -100,9 +102,32 @@ public struct MattermostPost: Codable, Sendable, Equatable, Identifiable {
   public let updateAt: Int64
   public let deleteAt: Int64
   public let hasReactions: Bool?
+  public var type: String? = nil
+  public var editAt: Int64? = nil
+
+  public var isSystem: Bool { type?.hasPrefix("system_") == true }
+
+  public init(
+    id: String, userID: String, channelID: String, rootID: String, message: String,
+    createAt: Int64, updateAt: Int64, deleteAt: Int64, hasReactions: Bool?,
+    type: String? = nil, editAt: Int64? = nil
+  ) {
+    self.id = id
+    self.userID = userID
+    self.channelID = channelID
+    self.rootID = rootID
+    self.message = message
+    self.createAt = createAt
+    self.updateAt = updateAt
+    self.deleteAt = deleteAt
+    self.hasReactions = hasReactions
+    self.type = type
+    self.editAt = editAt
+  }
 
   enum CodingKeys: String, CodingKey {
-    case id, message
+    case id, message, type
+    case editAt = "edit_at"
     case userID = "user_id"
     case channelID = "channel_id"
     case rootID = "root_id"

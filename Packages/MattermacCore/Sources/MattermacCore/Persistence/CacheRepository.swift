@@ -55,6 +55,13 @@ public struct CacheRepository: Sendable {
     }
   }
 
+  public func teams() async throws -> [MattermostTeam] {
+    try await persistence.transaction { context, _ in
+      try Records.fetch(context, predicate: NSPredicate(format: "kind == 'team'"), limit: 10_000)
+        .map { try Records.decode($0, as: MattermostTeam.self) }
+    }
+  }
+
   /// Complete joined-channel membership snapshot. Permission purges use bounded, idempotent batches
   /// before membership publication; a failed purge blocks publication and is retried on recovery.
   public func replaceChannels(_ channels: [MattermostChannel]) async throws {
@@ -102,6 +109,19 @@ public struct CacheRepository: Sendable {
         object.value(forKey: "isTombstone") as? Bool != true
       else { return nil }
       return try Records.decode(object)
+    }
+  }
+
+  /// Return accepted repository revisions after a history import, excluding durable tombstones.
+  public func posts(ids: [String], channelID: String) async throws -> [MattermostPost] {
+    guard ids.count <= 200 else { throw PersistenceError.invalidData }
+    return try await persistence.transaction { context, _ in
+      try Records.fetch(
+        context,
+        predicate: NSPredicate(
+          format: "kind == 'post' AND channelID == %@ AND isTombstone == NO AND id IN %@",
+          channelID, ids), limit: 200
+      ).map { try Records.decode($0) }
     }
   }
 

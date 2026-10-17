@@ -42,6 +42,27 @@ private actor Delays {
   func append(_ value: TimeInterval) { values.append(value) }
 }
 
+@Test func historyCursorAndAvatarUseAuthenticatedSubpathEndpoints() async throws {
+  let transport = ScriptedTransport([
+    .response(200, "{\"order\":[\"post1\"],\"posts\":{\"post1\":\(postJSON)}}"),
+    .response(200, "synthetic-image"),
+  ])
+  let api = try client(transport)
+  let token = try SessionToken("syntheticToken")
+  #expect(
+    try await api.olderPosts(channelID: "channel1", before: "cursor1", token: token).posts.count
+      == 1)
+  #expect(try await api.avatar(userID: "user1", token: token) == Data("synthetic-image".utf8))
+  let requests = await transport.requests
+  #expect(requests[0].url?.query == "before=cursor1&per_page=100")
+  #expect(requests[1].url?.path == "/mattermost/api/v4/users/user1/image")
+  #expect(
+    requests.allSatisfy {
+      $0.httpMethod == "GET"
+        && $0.value(forHTTPHeaderField: "Authorization") == "Bearer syntheticToken"
+    })
+}
+
 private func client(
   _ transport: ScriptedTransport,
   policy: APIRetryPolicy = .standard,
@@ -128,6 +149,29 @@ private func client(
   #expect(request.url?.path == "/mattermost/api/v4/posts")
   let body = try JSONSerialization.jsonObject(with: #require(request.httpBody)) as? [String: String]
   #expect(body == ["channel_id": "channel1", "message": "Synthetic post", "root_id": "root1"])
+}
+
+@Test func navigationReadsMembershipsAndBatchesPeerProfiles() async throws {
+  let transport = ScriptedTransport([
+    .response(200, #"[{"channel_id":"channel1","msg_count":8,"mention_count":2}]"#),
+    .response(200, "[\(userJSON)]"),
+  ])
+  let api = try client(transport)
+  let token = try SessionToken("syntheticToken")
+  let members = try await api.channelMemberships(teamID: "team1", token: token)
+  #expect(members.first?.msgCount == 8)
+  #expect(members.first?.mentionCount == 2)
+  #expect(try await api.users(ids: ["user1"], token: token).first?.username == "tester")
+  let requests = await transport.requests
+  #expect(requests[0].url?.path == "/mattermost/api/v4/users/me/teams/team1/channels/members")
+  #expect(requests[0].httpMethod == "GET")
+  #expect(requests[1].url?.path == "/mattermost/api/v4/users/ids")
+  #expect(requests[1].httpMethod == "POST")
+  #expect(
+    try JSONDecoder().decode([String].self, from: #require(requests[1].httpBody)) == ["user1"])
+  await #expect(throws: APIError.invalidConfiguration) {
+    try await api.users(ids: Array(repeating: "user1", count: 201), token: token)
+  }
 }
 
 @Test func reactionReadsUseBearerAndTolerateEmptyServerLists() async throws {

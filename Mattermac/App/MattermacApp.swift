@@ -32,7 +32,7 @@ struct MattermacApp: App {
   var body: some Scene {
     WindowGroup("Mattermac", id: "main") {
       AuthenticationView(session: session)
-        .frame(minWidth: 640, minHeight: 420)
+        .frame(minWidth: 760, minHeight: 420)
         .onAppear {
           lifecycle.start(session.realtime)
           AppLogger.lifecycle.info("Main window appeared")
@@ -40,6 +40,7 @@ struct MattermacApp: App {
     }
     .defaultSize(width: 960, height: 640)
     .commands {
+      WorkspaceCommands()
       CommandGroup(after: .appInfo) {
         Button("Check Session") { Task { await session.verify() } }
           .disabled(session.phase != .authenticated || session.isBusy)
